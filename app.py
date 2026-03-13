@@ -141,8 +141,40 @@ def get_next_lawyer():
 
 # ── File parsing ──────────────────────────────────────────────────────────────
 
+# Minimum characters from pdfplumber before we assume the PDF is scanned
+_MIN_TEXT_CHARS = 100
+
+
+def _ocr_pdf(raw_bytes):
+    """Convert a scanned PDF to text via pdf2image + pytesseract."""
+    try:
+        from pdf2image import convert_from_bytes
+        import pytesseract
+    except ImportError:
+        raise ValueError(
+            "OCR dependencies missing. Ensure pytesseract and pdf2image are in "
+            "requirements.txt, and tesseract-ocr + poppler-utils are in packages.txt."
+        )
+    try:
+        images = convert_from_bytes(raw_bytes, dpi=200)
+    except Exception as exc:
+        raise ValueError(f"Could not convert PDF pages to images: {exc}") from exc
+    try:
+        pages = [pytesseract.image_to_string(img) for img in images]
+    except Exception as exc:
+        raise ValueError(f"OCR failed: {exc}") from exc
+    text = "\n".join(pages).strip()
+    if not text:
+        raise ValueError("OCR produced no text. The PDF may be blank or unreadable.")
+    return text
+
+
 def extract_text(uploaded_file):
-    """Return (text, filename) from a PDF or DOCX upload."""
+    """Return (text, filename) from a PDF or DOCX upload.
+
+    For PDFs: tries pdfplumber first (fast, for text-based PDFs).
+    If that yields less than _MIN_TEXT_CHARS, assumes scanned and falls back to OCR.
+    """
     filename = uploaded_file.name
     ext      = filename.rsplit(".", 1)[-1].lower()
     raw      = uploaded_file.read()
@@ -152,9 +184,14 @@ def extract_text(uploaded_file):
         try:
             with pdfplumber.open(io.BytesIO(raw)) as pdf:
                 text = "\n".join(p.extract_text() or "" for p in pdf.pages)
-            return text, filename
         except Exception as exc:
             raise ValueError(f"Cannot parse PDF: {exc}") from exc
+
+        if len(text.strip()) < _MIN_TEXT_CHARS:
+            # Scanned PDF — fall back to OCR
+            text = _ocr_pdf(raw)
+
+        return text, filename
 
     if ext == "docx":
         from docx import Document
