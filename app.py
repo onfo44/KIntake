@@ -255,11 +255,16 @@ def extract_terms(text):
             ],
         )
         raw = response.content[0].text.strip()
-        # Strip accidental markdown code fences
-        if raw.startswith("```"):
-            parts = raw.split("```")
-            raw   = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
-        return json.loads(raw)
+        # Use regex to extract the first {...} block, regardless of
+        # surrounding text, code fences, or preamble Claude may add.
+        import re
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            preview = raw[:200] if raw else "(empty response)"
+            raise ValueError(
+                f"No JSON object found in Claude's response. Preview: {preview}"
+            )
+        return json.loads(match.group(0))
     except json.JSONDecodeError as exc:
         raise ValueError(f"Claude returned invalid JSON: {exc}") from exc
     except Exception as exc:
