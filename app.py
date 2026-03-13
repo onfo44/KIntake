@@ -195,6 +195,38 @@ CONTRACT TEXT:
 """
 
 
+def parse_date_str(s, fallback=None):
+    """Best-effort parse of a Claude date string to datetime.date."""
+    if not s or not isinstance(s, str):
+        return fallback or date.today()
+    from datetime import datetime as _dt
+    for fmt in (
+        "%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y",
+        "%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%Y/%m/%d",
+    ):
+        try:
+            return _dt.strptime(s.strip(), fmt).date()
+        except ValueError:
+            continue
+    return fallback or date.today()
+
+
+def map_region(s):
+    """Map a Claude-inferred region string to a valid selectbox option."""
+    if not s:
+        return "Other"
+    sl = s.lower()
+    if any(x in sl for x in ["us", "united states", "america", "u.s."]):
+        return "US"
+    if any(x in sl for x in ["europe", "eu ", "european"]):
+        return "Europe"
+    if any(x in sl for x in ["asia", "pacific", "apac"]):
+        return "Asia-Pacific"
+    if any(x in sl for x in ["global", "worldwide", "international"]):
+        return "Global"
+    return "Other"
+
+
 def extract_terms(text):
     """Call Claude API and return a dict of extracted contract terms."""
     try:
@@ -500,63 +532,148 @@ def page_tracker():
 def page_executed():
     st.header("✅ Executed Contracts Dashboard")
 
-    # ── Log form ──────────────────────────────────────────────────────────────
-    with st.expander("➕ Log Executed Contract", expanded=False):
+    # ── Helpers (local, used in form) ─────────────────────────────────────────
+    def yn(val, default="N"):
+        return "Y" if str(val).strip().lower() == "yes" else default
+
+    def ns_map(val):
+        v = str(val).strip().lower()
+        if v == "yes": return "Y"
+        if v == "no":  return "N"
+        return "N/A"
+
+    REGION_OPTS = ["US", "Europe", "Asia-Pacific", "Global", "Other"]
+    AR_OPTS     = ["N", "Y"]
+    NS_OPTS     = ["N/A", "Y", "N"]
+
+    # ── Step 1: Upload & extract (always visible) ─────────────────────────────
+    with st.container(border=True):
+        st.markdown("#### 📤 Log Executed Contract")
+        up_col, ext_col, man_col = st.columns([5, 1, 1])
+        with up_col:
+            ec_file = st.file_uploader(
+                "Upload executed contract (PDF or DOCX)",
+                type=["pdf", "docx"],
+                key="ec_upload",
+            )
+        with ext_col:
+            st.markdown("<br>", unsafe_allow_html=True)
+            extract_clicked = st.button(
+                "Extract ▶",
+                disabled=(ec_file is None),
+                key="ec_extract_btn",
+                type="primary",
+                help="Upload a file first, then click to auto-fill fields with Claude",
+            )
+        with man_col:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Manual Entry", key="ec_manual_btn", type="secondary"):
+                st.session_state["ec_show_form"] = True
+                st.session_state.pop("ec_prefill", None)
+                st.rerun()
+
+    if extract_clicked and ec_file is not None:
+        with st.spinner("Parsing and analyzing with Claude…"):
+            try:
+                text, fname = extract_text(ec_file)
+                terms = extract_terms(text)
+                terms["_filename"] = fname
+                st.session_state["ec_prefill"]  = terms
+                st.session_state["ec_show_form"] = True
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+
+    # ── Step 2: Review / entry form (shown after extraction or manual click) ──
+    pf        = st.session_state.get("ec_prefill", {})
+    show_form = st.session_state.get("ec_show_form", False)
+
+    if show_form:
+        if pf:
+            st.success(
+                f"Terms extracted from **{pf.get('_filename', 'file')}** — "
+                "review and adjust below, then save."
+            )
+
+        pf_region = map_region(pf.get("region_inferred", ""))
+        pf_ar     = yn(pf.get("auto_renewal", "N"))
+        pf_ns     = ns_map(pf.get("non_solicit", "N/A"))
+        pf_start  = parse_date_str(pf.get("start_date"),  date.today())
+        pf_end    = parse_date_str(pf.get("end_date"),    date.today() + timedelta(days=365))
+        pf_nsdate = parse_date_str(
+            pf.get("non_solicit_termination_date"), date.today() + timedelta(days=365)
+        )
+
         with st.form("exec_form", clear_on_submit=True):
             c1, c2 = st.columns(2)
             with c1:
-                f_orig   = st.text_input("Contract Originator")
-                f_dsub   = st.date_input("Date Submitted",  value=date.today())
-                f_dexec  = st.date_input("Date Executed",   value=date.today())
-                f_pa     = st.text_input("Party A")
-                f_pb     = st.text_input("Party B")
-                f_desc   = st.text_input("Description of Service (≤10 words)")
-                f_region = st.selectbox(
-                    "Relevant Region", ["US", "Europe", "Asia-Pacific", "Global", "Other"]
-                )
+                f_orig   = st.text_input("Contract Originator",         value=pf.get("party_a", ""))
+                f_dsub   = st.date_input("Date Submitted",               value=date.today())
+                f_dexec  = st.date_input("Date Executed",                value=date.today())
+                f_pa     = st.text_input("Party A",                      value=pf.get("party_a", ""))
+                f_pb     = st.text_input("Party B",                      value=pf.get("party_b", ""))
+                f_desc   = st.text_input("Description of Service (≤10 words)",
+                                         value=pf.get("description_of_service", ""))
+                f_region = st.selectbox("Relevant Region", REGION_OPTS,
+                                        index=REGION_OPTS.index(pf_region))
                 f_dept   = st.text_input("Responsible Department")
                 f_emps   = st.text_input("Individual Employee Owners (comma-separated)")
             with c2:
-                f_start  = st.date_input("Start Date", value=date.today())
-                f_end    = st.date_input(
-                    "End Date", value=date.today() + timedelta(days=365)
-                )
-                f_term   = st.text_area("Termination Requirements")
-                f_ar     = st.selectbox("Auto Renewal", ["N", "Y"])
-                f_ns     = st.selectbox("Non-Solicit", ["N/A", "Y", "N"])
-                # NOTE: Inside st.form, disabled= is evaluated at render time
-                # and won't react to same-submission selectbox changes.
-                # The field is disabled when the default ("N/A") is active;
-                # users must select "Y" and re-open the form to enable it.
-                f_nsdate = st.date_input(
-                    "Non-Solicit Termination Date",
-                    value=date.today() + timedelta(days=365),
-                    disabled=(f_ns != "Y"),
-                )
-                f_notes  = st.text_area("Additional Notes/Terms")
-                f_link   = st.text_input("Link to Contract (URL or file path)")
+                f_start  = st.date_input("Start Date", value=pf_start)
+                f_end    = st.date_input("End Date",   value=pf_end)
+                f_term   = st.text_area("Termination Requirements",
+                                        value=pf.get("termination_requirements", ""))
+                f_ar     = st.selectbox("Auto Renewal", AR_OPTS,
+                                        index=AR_OPTS.index(pf_ar))
+                f_ns     = st.selectbox("Non-Solicit", NS_OPTS,
+                                        index=NS_OPTS.index(pf_ns))
+                # NOTE: disabled= is evaluated at render time inside st.form.
+                # To enable this field, select "Y" for Non-Solicit, save/cancel,
+                # then re-enter the form — this is a Streamlit form limitation.
+                f_nsdate = st.date_input("Non-Solicit Termination Date",
+                                         value=pf_nsdate, disabled=(f_ns != "Y"))
+                f_notes  = st.text_area("Additional Notes/Terms",
+                                        value=pf.get("summary", ""))
+                f_link   = st.text_input("Link to Contract (URL or file path)",
+                                         value=pf.get("_filename", ""))
 
-            if st.form_submit_button("Save Executed Contract ▶", type="primary"):
-                ns_date = str(f_nsdate) if f_ns == "Y" else None
-                db_write(
-                    """
-                    INSERT INTO executed_contracts (
-                        contract_originator, date_submitted, date_executed,
-                        party_a, party_b, description_of_service, region,
-                        department, employee_owners, start_date, end_date,
-                        termination_requirements, auto_renewal, non_solicit,
-                        non_solicit_termination_date, notes, contract_link
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        f_orig, str(f_dsub), str(f_dexec),
-                        f_pa, f_pb, f_desc, f_region,
-                        f_dept, f_emps, str(f_start), str(f_end),
-                        f_term, f_ar, f_ns, ns_date, f_notes, f_link,
-                    ),
-                )
-                st.success("✅ Executed contract saved.")
-                st.rerun()
+            save_col, cancel_col, _ = st.columns([1, 1, 5])
+            with save_col:
+                saved = st.form_submit_button("💾 Save Contract", type="primary")
+            with cancel_col:
+                cancelled = st.form_submit_button("✕ Cancel", type="secondary")
+
+        if saved:
+            ns_date = str(f_nsdate) if f_ns == "Y" else None
+            db_write(
+                """
+                INSERT INTO executed_contracts (
+                    contract_originator, date_submitted, date_executed,
+                    party_a, party_b, description_of_service, region,
+                    department, employee_owners, start_date, end_date,
+                    termination_requirements, auto_renewal, non_solicit,
+                    non_solicit_termination_date, notes, contract_link
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    f_orig, str(f_dsub), str(f_dexec),
+                    f_pa, f_pb, f_desc, f_region,
+                    f_dept, f_emps, str(f_start), str(f_end),
+                    f_term, f_ar, f_ns, ns_date, f_notes, f_link,
+                ),
+            )
+            st.session_state.pop("ec_prefill",   None)
+            st.session_state.pop("ec_show_form", None)
+            st.session_state.pop("ec_upload",    None)
+            st.success("✅ Contract saved.")
+            st.rerun()
+
+        if cancelled:
+            st.session_state.pop("ec_prefill",   None)
+            st.session_state.pop("ec_show_form", None)
+            st.rerun()
+
+    st.divider()
 
     # ── Load data ─────────────────────────────────────────────────────────────
     df = db_df("SELECT * FROM executed_contracts ORDER BY id DESC")
